@@ -7,7 +7,7 @@ A compiled self-signed APK is available in Releases.
 
 ## To Use
 
-1. Open the app on your Android device.
+1. Open this app on your Android device.
 2. Select a port, you will likely leave this at 14580, which is the default port used by APRSDroid.
 3. Make sure your RT-950 Pro is switched on, has Bluetooth enabled and is in KISS mode.
 4. Tap "Scan for RT950Pro"
