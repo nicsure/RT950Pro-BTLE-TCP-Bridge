@@ -12,19 +12,18 @@ android {
     defaultConfig {
         applicationId = "uk.co.nicsure.rt950btlebridge"
         minSdk = 26
-        targetSdk = 37
-        versionCode = 2
-        versionName = "1.1"
+        targetSdk = 36
+        versionCode = 4
+        versionName = "1.3"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
         release {
-            optimization {
-                enable = true
-                packageScope = setOf("androidx.**", "kotlin.**", "kotlinx.**")
-            }
+            // Keep R8 off for beta builds. The current AGP release pipeline is
+            // rewriting Kotlin collection classes in a way that crashes at startup.
+            isMinifyEnabled = false
         }
     }
     compileOptions {
