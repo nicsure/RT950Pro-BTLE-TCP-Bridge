@@ -21,5 +21,7 @@ Compiled self-signed APKs are available in [Releases](https://github.com/nicsure
 
 Once connected to your RT-950 Pro over Bluetooth, a button will appear  `Open Channel Manager`  
 This will pause the TCP Bridge and allow you to manage the radio's channels in a similar way to the RMS.  
-I would advise against using `Read All` and `Write All` as it will be very slow. Instead make use of the `Read Selected` and `Write Selected` buttons.
+I would advise against using `Read All` and `Write All` as it will be very slow. Instead make use of the `Read Selected` and `Write Selected` buttons.  
+
+Note: The channel manager is only compatible with nicFW950, it will not work with the Radtel stock firmware.
   
