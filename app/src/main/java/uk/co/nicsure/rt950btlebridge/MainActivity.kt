@@ -23,6 +23,8 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -46,6 +48,9 @@ class MainActivity : ComponentActivity() {
     private var status by mutableStateOf("Not connected")
     private var scanning by mutableStateOf(false)
     private var bridgeRunning by mutableStateOf(false)
+    private var bleConnected by mutableStateOf(false)
+    private var channelManagerOpen by mutableStateOf(false)
+    private var openingChannelManager by mutableStateOf(false)
     private var port by mutableStateOf("14580")
     private var bridgeService: BridgeService? = null
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -57,10 +62,16 @@ class MainActivity : ComponentActivity() {
                 mainHandler.post {
                     status = message
                     bridgeRunning = message != "Stopped" && message != "Not connected"
+                    bleConnected = bridgeService?.isBleConnected == true
+                    if (message == "Stopped") {
+                        bleConnected = false
+                        channelManagerOpen = false
+                    }
                 }
             }
             status = bridgeService?.currentStatus ?: status
             bridgeRunning = status != "Stopped" && status != "Not connected"
+            bleConnected = bridgeService?.isBleConnected == true
         }
         override fun onServiceDisconnected(name: android.content.ComponentName?) {
             bridgeService = null
@@ -97,43 +108,58 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        channelManagerOpen = savedInstanceState?.getBoolean(STATE_CHANNEL_MANAGER_OPEN) ?: false
         setContent {
             RT950ProBTLETCPBridgeTheme {
-                Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    Column(Modifier.fillMaxSize().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Text("RT950Pro BTLE TCP Bridge", style = MaterialTheme.typography.headlineSmall)
-                        Text(status, style = MaterialTheme.typography.bodyLarge)
-                        OutlinedTextField(
-                            value = port,
-                            onValueChange = { value -> if (value.length <= 5 && value.all(Char::isDigit)) port = value },
-                            label = { Text("TCP port") },
-                            singleLine = true,
-                            enabled = !bridgeRunning,
-                            modifier = Modifier.fillMaxWidth()
+                Surface(modifier = Modifier.fillMaxSize().navigationBarsPadding().imePadding(), color = MaterialTheme.colorScheme.background) {
+                    if (channelManagerOpen && bridgeService != null) {
+                        ChannelManagerScreen(
+                            service = bridgeService!!,
+                            isConnected = bleConnected,
+                            onExit = { closeChannelManager() },
+                            onStopBridge = { stopBridge() }
                         )
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button(onClick = { requestPermissionsAndScan() }, enabled = !scanning && !bridgeRunning) {
-                                Text(if (scanning) "Scanning…" else "Scan for RT950Pro")
+                    } else {
+                        Column(Modifier.fillMaxSize().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            Text("RT950Pro BTLE TCP Bridge", style = MaterialTheme.typography.headlineSmall)
+                            Text(status, style = MaterialTheme.typography.bodyLarge)
+                            OutlinedTextField(
+                                value = port,
+                                onValueChange = { value -> if (value.length <= 5 && value.all(Char::isDigit)) port = value },
+                                label = { Text("TCP port") },
+                                singleLine = true,
+                                enabled = !bridgeRunning,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Button(onClick = { requestPermissionsAndScan() }, enabled = !scanning && !bridgeRunning) {
+                                    Text(if (scanning) "Scanning…" else "Scan for RT950Pro")
+                                }
+                                if (scanning) Button(onClick = { stopScan() }) { Text("Stop scan") }
+                                if (bridgeRunning) Button(onClick = { stopBridge() }) { Text("Stop bridge") }
                             }
-                            if (scanning) Button(onClick = { stopScan() }) { Text("Stop scan") }
-                            if (bridgeRunning) Button(onClick = { stopBridge() }) { Text("Stop bridge") }
-                        }
-                        Text("Tap the RT950Pro in the scan results to connect. The first TCP client gets an initial FFE1 read, then receives updates; client bytes are written to FFE1.")
-                        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            items(devices, key = { it.address }) { item ->
-                                Card(Modifier.fillMaxWidth().clickable(enabled = !bridgeRunning) { connect(item) }) {
-                                    Column(Modifier.padding(14.dp)) {
-                                        Text(item.name, style = MaterialTheme.typography.titleMedium)
-                                        Text(item.address, style = MaterialTheme.typography.bodySmall)
-                                        if (item.device.name?.contains("950", ignoreCase = true) == true || item.name.contains("950", ignoreCase = true)) {
-                                            Text("Name looks like an RT950 device")
+                            if (bleConnected) {
+                                Button(onClick = { openChannelManager() }, enabled = !openingChannelManager) {
+                                    Text(if (openingChannelManager) "Pausing bridge…" else "Open Channel Manager")
+                                }
+                            }
+                            Text("Tap the RT950Pro in the scan results to connect. The first TCP client gets an initial FFE1 read, then receives updates; client bytes are written to FFE1.")
+                            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.weight(1f)) {
+                                items(devices, key = { it.address }) { item ->
+                                    Card(Modifier.fillMaxWidth().clickable(enabled = !bridgeRunning) { connect(item) }) {
+                                        Column(Modifier.padding(14.dp)) {
+                                            Text(item.name, style = MaterialTheme.typography.titleMedium)
+                                            Text(item.address, style = MaterialTheme.typography.bodySmall)
+                                            if (item.device.name?.contains("950", ignoreCase = true) == true || item.name.contains("950", ignoreCase = true)) {
+                                                Text("Name looks like an RT950 device")
+                                            }
                                         }
                                     }
                                 }
                             }
+                            Spacer(Modifier.height(2.dp))
+                            Text("Service FFE0 · Characteristic FFE1 · one TCP client · listens on the local network without encryption or a password")
                         }
-                        Spacer(Modifier.height(2.dp))
-                        Text("Service FFE0 · Characteristic FFE1 · one TCP client · listens on the local network without encryption or a password")
                     }
                 }
             }
@@ -205,11 +231,41 @@ class MainActivity : ComponentActivity() {
         status = "Stopping bridge…"
     }
 
+    private fun openChannelManager() {
+        if (openingChannelManager) return
+        openingChannelManager = true
+        val service = bridgeService
+        Thread({
+            val opened = runCatching { service?.pauseProxyForChannelManager() == true }.getOrDefault(false)
+            mainHandler.post {
+                openingChannelManager = false
+                if (opened) channelManagerOpen = true
+                else status = "Could not open Channel Manager; the RT950Pro must be connected."
+            }
+        }, "channel-manager-pause").start()
+    }
+
+    private fun closeChannelManager() {
+        val service = bridgeService
+        Thread({
+            runCatching { service?.resumeProxyFromChannelManager() }
+            mainHandler.post { channelManagerOpen = false }
+        }, "channel-manager-resume").start()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean(STATE_CHANNEL_MANAGER_OPEN, channelManagerOpen)
+        super.onSaveInstanceState(outState)
+    }
+
     override fun onDestroy() {
         stopScan()
+        if (isFinishing && channelManagerOpen) runCatching { bridgeService?.resumeProxyFromChannelManager() }
         runCatching { unbindService(serviceConnection) }
         super.onDestroy()
     }
+
+    companion object { private const val STATE_CHANNEL_MANAGER_OPEN = "channel_manager_open" }
 }
 
 private data class FoundDevice(val device: BluetoothDevice, val name: String, val address: String)

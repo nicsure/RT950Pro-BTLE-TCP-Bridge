@@ -30,6 +30,8 @@ import java.net.Socket
 import java.util.UUID
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 class BridgeService : Service() {
     inner class LocalBinder : Binder() { val service: BridgeService get() = this@BridgeService }
@@ -50,11 +52,18 @@ class BridgeService : Service() {
     @Volatile private var listenerStarted = false
     @Volatile private var initialValue: ByteArray? = null
     @Volatile private var mtuPayload = 20
+    @Volatile private var channelManagerMode = false
     private var requestedPort = 14580
     private var deviceName = "RT950Pro"
     private val writeQueue = ArrayBlockingQueue<ByteArray>(256)
+    private val channelNotifications = ArrayBlockingQueue<ByteArray>(1024)
+    private var channelNotificationRemainder = ByteArray(0)
+    private val bleIoLock = ReentrantLock(true)
     @Volatile private var pendingWrite: java.util.concurrent.CountDownLatch? = null
     @Volatile private var writeResult = BluetoothGatt.GATT_FAILURE
+
+    val isBleConnected: Boolean get() = connected
+    val isChannelManagerOpen: Boolean get() = channelManagerMode
 
     override fun onBind(intent: Intent?): IBinder = binder
 
@@ -108,6 +117,8 @@ class BridgeService : Service() {
         if (!running || reconnectRunnable != null) return
         connected = false
         characteristic = null
+        channelNotifications.clear()
+        channelNotificationRemainder = ByteArray(0)
         pendingWrite?.let {
             writeResult = BluetoothGatt.GATT_FAILURE
             it.countDown()
@@ -184,11 +195,11 @@ class BridgeService : Service() {
 
         @Deprecated("Legacy callback retained for Android 8–12")
         override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic) {
-            if (g === gatt && Build.VERSION.SDK_INT < 33) forwardBleToTcp(c.value?.copyOf() ?: return)
+            if (g === gatt && Build.VERSION.SDK_INT < 33) routeBleUpdate(c.value?.copyOf() ?: return)
         }
 
         override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray) {
-            if (g === gatt) forwardBleToTcp(value.copyOf())
+            if (g === gatt) routeBleUpdate(value.copyOf())
         }
 
         override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
@@ -211,7 +222,7 @@ class BridgeService : Service() {
         override fun onCharacteristicRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) {
             if (g === gatt && Build.VERSION.SDK_INT < 33 && c.uuid == CHARACTERISTIC_UUID) {
                 initialValue = if (status == BluetoothGatt.GATT_SUCCESS) c.value?.copyOf() else null
-                if (initialValue != null && client != null) forwardBleToTcp(initialValue!!)
+                if (initialValue != null && client != null && !channelManagerMode) forwardBleToTcp(initialValue!!)
                 bleReady()
             }
         }
@@ -219,7 +230,7 @@ class BridgeService : Service() {
         override fun onCharacteristicRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray, status: Int) {
             if (g === gatt && c.uuid == CHARACTERISTIC_UUID) {
                 initialValue = if (status == BluetoothGatt.GATT_SUCCESS) value.copyOf() else null
-                if (initialValue != null && client != null) forwardBleToTcp(initialValue!!)
+                if (initialValue != null && client != null && !channelManagerMode) forwardBleToTcp(initialValue!!)
                 bleReady()
             }
         }
@@ -258,7 +269,7 @@ class BridgeService : Service() {
                             val count = input.read(buffer)
                             if (count < 0) break
                             val bytes = buffer.copyOf(count)
-                            if (!writeQueue.offer(bytes, 2, TimeUnit.SECONDS)) throw IOException("BLE write queue is full")
+                            if (!channelManagerMode && !writeQueue.offer(bytes, 2, TimeUnit.SECONDS)) throw IOException("BLE write queue is full")
                         }
                     } catch (e: Exception) {
                         if (running) Log.i(TAG, "TCP client read ended: ${e.message}")
@@ -278,14 +289,17 @@ class BridgeService : Service() {
     private fun writeSocketToBle(socket: Socket) {
         try {
             while (running && !socket.isClosed) {
-                val packet = writeQueue.poll(500, TimeUnit.MILLISECONDS) ?: continue
-                var offset = 0
-                while (offset < packet.size && running && !socket.isClosed) {
-                    val end = minOf(offset + mtuPayload, packet.size)
-                    val chunk = packet.copyOfRange(offset, end)
-                    if (!writeGattChunk(chunk)) throw IOException("BLE characteristic write failed")
-                    offset = end
+                if (channelManagerMode) {
+                    writeQueue.clear()
+                    Thread.sleep(100)
+                    continue
                 }
+                val packet = writeQueue.poll(500, TimeUnit.MILLISECONDS) ?: continue
+                val completed = bleIoLock.withLock {
+                    if (channelManagerMode) true // discard bytes queued before the pause took effect
+                    else writeGattBytesUnlocked(packet)
+                }
+                if (!completed) throw IOException("BLE characteristic write failed")
             }
         } catch (e: Exception) {
             if (running && !socket.isClosed) Log.w(TAG, "TCP to BLE writer ended", e)
@@ -294,7 +308,7 @@ class BridgeService : Service() {
     }
 
     @Suppress("DEPRECATION")
-    private fun writeGattChunk(bytes: ByteArray): Boolean {
+    private fun writeGattChunkUnlocked(bytes: ByteArray): Boolean {
         while (running) {
             while (running && !connected) Thread.sleep(250)
             if (!running) return false
@@ -325,6 +339,250 @@ class BridgeService : Service() {
             return false
         }
         return false
+    }
+
+    private fun writeGattBytesUnlocked(bytes: ByteArray): Boolean {
+        var offset = 0
+        while (offset < bytes.size && running && connected) {
+            val end = minOf(offset + mtuPayload, bytes.size)
+            if (!writeGattChunkUnlocked(bytes.copyOfRange(offset, end))) return false
+            offset = end
+        }
+        return offset == bytes.size
+    }
+
+    private fun routeBleUpdate(bytes: ByteArray) {
+        if (channelManagerMode) {
+            if (!channelNotifications.offer(bytes)) {
+                channelNotifications.poll()
+                channelNotifications.offer(bytes)
+            }
+        } else {
+            forwardBleToTcp(bytes)
+        }
+    }
+
+    /** Pauses raw TCP forwarding while the UI uses FFE1 for device commands. */
+    fun pauseProxyForChannelManager(): Boolean = bleIoLock.withLock {
+        if (!running || !connected || characteristic == null) return false
+        if (!channelManagerMode) {
+            channelManagerMode = true
+            writeQueue.clear()
+            channelNotifications.clear()
+            channelNotificationRemainder = ByteArray(0)
+            publish("Channel Manager open. TCP forwarding is paused.")
+        }
+        true
+    }
+
+    fun resumeProxyFromChannelManager() {
+        bleIoLock.withLock {
+            if (!channelManagerMode) return
+            channelNotifications.clear()
+            channelNotificationRemainder = ByteArray(0)
+            writeQueue.clear()
+            channelManagerMode = false
+            publish("Channel Manager closed. TCP forwarding resumed.")
+        }
+    }
+
+    fun readChannelMemory(onProgress: (Int, Int) -> Unit): ByteArray {
+        check(channelManagerMode) { "Open Channel Manager before reading channel data." }
+        check(connected) { "The RT950Pro is not connected." }
+        val data = ByteArray(CHANNEL_MEMORY_LENGTH)
+        val blocks = CHANNEL_MEMORY_LENGTH / CHANNEL_BLOCK_SIZE
+        repeat(blocks) { block ->
+            val offset = block * CHANNEL_BLOCK_SIZE
+            val address = CHANNEL_MEMORY_ADDRESS + offset
+            val response = bleIoLock.withLock {
+                sendChannelBytes(readRequest(address))
+                readChannelBytes(CHANNEL_READ_RESPONSE_SIZE, 15_000)
+            }
+            validateChannelResponse(response, 0x30, address)
+            response.copyInto(data, offset, 6, 6 + CHANNEL_BLOCK_SIZE)
+            onProgress(block + 1, blocks)
+        }
+        return data
+    }
+
+    fun writeChannelMemory(data: ByteArray, onProgress: (Int, Int) -> Unit) {
+        require(data.size == CHANNEL_MEMORY_LENGTH) { "Channel data has an unexpected size." }
+        check(channelManagerMode) { "Open Channel Manager before writing channel data." }
+        check(connected) { "The RT950Pro is not connected." }
+        val blocks = CHANNEL_MEMORY_LENGTH / CHANNEL_BLOCK_SIZE
+        repeat(blocks) { block ->
+            val offset = block * CHANNEL_BLOCK_SIZE
+            val address = CHANNEL_MEMORY_ADDRESS + offset
+            bleIoLock.withLock {
+                val packet = ByteArray(CHANNEL_WRITE_PACKET_SIZE)
+                packet[0] = 0xAA.toByte()
+                packet[1] = 0x40
+                putAddress(packet, address)
+                data.copyInto(packet, 6, offset, offset + CHANNEL_BLOCK_SIZE)
+                packet[packet.lastIndex] = channelChecksum(packet, 2, packet.lastIndex)
+                sendChannelBytes(packet)
+                expectAck(0x40)
+            }
+            onProgress(block + 1, blocks)
+        }
+        bleIoLock.withLock {
+            sendChannelBytes(byteArrayOf(0xAA.toByte(), 0x48))
+            expectAck(0x48)
+            // The desktop channel manager commits the flash and then reboots the radio.
+            sendChannelBytes(byteArrayOf(0xAA.toByte(), 0x50))
+            expectAck(0x48)
+        }
+    }
+
+    fun readSelectedChannelBlocks(data: ByteArray, firstOffset: Int, lastOffsetExclusive: Int) {
+        require(data.size == CHANNEL_MEMORY_LENGTH)
+        readChannelBlocks(data, blockOffsets(firstOffset, lastOffsetExclusive))
+    }
+
+    fun writeSelectedChannelBlocks(data: ByteArray, firstOffset: Int, lastOffsetExclusive: Int, onProgress: (Int, Int) -> Unit) {
+        writeChannelBlocks(data, blockOffsets(firstOffset, lastOffsetExclusive), onProgress)
+    }
+
+    fun readSelectedChannels(data: ByteArray, channelNumbers: List<Int>) {
+        require(channelNumbers.isNotEmpty()) { "Select at least one channel." }
+        val offsets = channelNumbers.flatMap { number -> channelBlockOffsets(number) }.distinct().sorted()
+        readChannelBlocks(data, offsets)
+    }
+
+    fun writeSelectedChannels(data: ByteArray, channelNumbers: List<Int>, onProgress: (Int, Int) -> Unit) {
+        require(channelNumbers.isNotEmpty()) { "Select at least one channel." }
+        val offsets = channelNumbers.flatMap { number -> channelBlockOffsets(number) }.distinct().sorted()
+        writeChannelBlocks(data, offsets, onProgress)
+    }
+
+    private fun readChannelBlocks(data: ByteArray, offsets: List<Int>) {
+        require(data.size == CHANNEL_MEMORY_LENGTH)
+        check(channelManagerMode && connected)
+        for (offset in offsets) {
+            val address = CHANNEL_MEMORY_ADDRESS + offset
+            val response = bleIoLock.withLock {
+                sendChannelBytes(readRequest(address))
+                readChannelBytes(CHANNEL_READ_RESPONSE_SIZE, 15_000)
+            }
+            validateChannelResponse(response, 0x30, address)
+            response.copyInto(data, offset, 6, 6 + CHANNEL_BLOCK_SIZE)
+        }
+    }
+
+    private fun writeChannelBlocks(data: ByteArray, offsets: List<Int>, onProgress: (Int, Int) -> Unit) {
+        require(data.size == CHANNEL_MEMORY_LENGTH)
+        check(offsets.isNotEmpty()) { "Select at least one channel." }
+        check(channelManagerMode && connected)
+        offsets.forEachIndexed { index, offset ->
+            val address = CHANNEL_MEMORY_ADDRESS + offset
+            bleIoLock.withLock {
+                val packet = ByteArray(CHANNEL_WRITE_PACKET_SIZE)
+                packet[0] = 0xAA.toByte()
+                packet[1] = 0x40
+                putAddress(packet, address)
+                data.copyInto(packet, 6, offset, offset + CHANNEL_BLOCK_SIZE)
+                packet[packet.lastIndex] = channelChecksum(packet, 2, packet.lastIndex)
+                sendChannelBytes(packet)
+                expectAck(0x40)
+            }
+            onProgress(index + 1, offsets.size)
+        }
+        bleIoLock.withLock {
+            sendChannelBytes(byteArrayOf(0xAA.toByte(), 0x48))
+            expectAck(0x48)
+            sendChannelBytes(byteArrayOf(0xAA.toByte(), 0x50))
+            expectAck(0x48)
+        }
+    }
+
+    private fun blockOffsets(firstOffset: Int, lastOffsetExclusive: Int): List<Int> {
+        require(firstOffset >= 0 && lastOffsetExclusive > firstOffset && lastOffsetExclusive <= CHANNEL_MEMORY_LENGTH)
+        val blockStart = firstOffset / CHANNEL_BLOCK_SIZE * CHANNEL_BLOCK_SIZE
+        val blockEnd = ((lastOffsetExclusive + CHANNEL_BLOCK_SIZE - 1) / CHANNEL_BLOCK_SIZE) * CHANNEL_BLOCK_SIZE
+        require(blockEnd <= CHANNEL_MEMORY_LENGTH)
+        return (blockStart until blockEnd step CHANNEL_BLOCK_SIZE).toList()
+    }
+
+    private fun channelBlockOffsets(number: Int): List<Int> {
+        require(number in 1..999) { "Channel number must be between 1 and 999." }
+        val offset = (number + 3) * 62
+        return blockOffsets(offset, offset + 62)
+    }
+
+    private fun sendChannelBytes(bytes: ByteArray) {
+        if (!running || !connected || !writeGattBytesUnlocked(bytes)) {
+            throw IOException("BLE write failed while communicating with the RT950Pro.")
+        }
+    }
+
+    private fun readChannelBytes(count: Int, timeoutMs: Long): ByteArray {
+        val result = ByteArray(count)
+        var offset = 0
+        var pending = ByteArray(0)
+        var pendingOffset = 0
+        while (offset < count) {
+            if (pendingOffset >= pending.size) {
+                pending = if (channelNotificationRemainder.isNotEmpty()) {
+                    channelNotificationRemainder.also { channelNotificationRemainder = ByteArray(0) }
+                } else {
+                    channelNotifications.poll(timeoutMs, TimeUnit.MILLISECONDS)
+                        ?: throw IOException("Timed out waiting for an RT950Pro response.")
+                }
+                pendingOffset = 0
+            }
+            val take = minOf(count - offset, pending.size - pendingOffset)
+            pending.copyInto(result, offset, pendingOffset, pendingOffset + take)
+            offset += take
+            pendingOffset += take
+            if (pendingOffset < pending.size) {
+                channelNotificationRemainder = pending.copyOfRange(pendingOffset, pending.size)
+                pendingOffset = pending.size
+            }
+        }
+        return result
+    }
+
+    private fun expectAck(command: Int) {
+        val ack = readChannelBytes(2, 10_000)
+        if ((ack[0].toInt() and 0xFF) != 0xAA || (ack[1].toInt() and 0xFF) != command) {
+            val received = ack.joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }
+            throw IOException("Unexpected RT950Pro acknowledgement ($received).")
+        }
+    }
+
+    private fun validateChannelResponse(packet: ByteArray, command: Int, address: Int) {
+        val actualAddress = (packet[2].toInt() and 0xFF) or
+            ((packet[3].toInt() and 0xFF) shl 8) or
+            ((packet[4].toInt() and 0xFF) shl 16) or
+            ((packet[5].toInt() and 0xFF) shl 24)
+        if ((packet[0].toInt() and 0xFF) != 0xAA || (packet[1].toInt() and 0xFF) != command || actualAddress != address) {
+            throw IOException("Unexpected RT950Pro response for address 0x${address.toString(16)}.")
+        }
+        if (channelChecksum(packet, 2, packet.lastIndex) != packet.last()) {
+            throw IOException("RT950Pro response checksum mismatch at address 0x${address.toString(16)}.")
+        }
+    }
+
+    private fun readRequest(address: Int): ByteArray = byteArrayOf(
+        0xAA.toByte(), 0x30,
+        (address and 0xFF).toByte(),
+        ((address ushr 8) and 0xFF).toByte(),
+        ((address ushr 16) and 0xFF).toByte(),
+        ((address ushr 24) and 0xFF).toByte(),
+        0
+    )
+
+    private fun putAddress(packet: ByteArray, address: Int) {
+        packet[2] = (address and 0xFF).toByte()
+        packet[3] = ((address ushr 8) and 0xFF).toByte()
+        packet[4] = ((address ushr 16) and 0xFF).toByte()
+        packet[5] = ((address ushr 24) and 0xFF).toByte()
+    }
+
+    private fun channelChecksum(packet: ByteArray, start: Int, endExclusive: Int): Byte {
+        var sum = 0
+        for (index in start until endExclusive) sum = (sum + (packet[index].toInt() and 0xFF)) and 0xFF
+        return sum.toByte()
     }
 
     private fun completeGattWrite(status: Int) {
@@ -385,6 +643,9 @@ class BridgeService : Service() {
     private fun stopBridge() {
         running = false
         connected = false
+        channelManagerMode = false
+        channelNotifications.clear()
+        channelNotificationRemainder = ByteArray(0)
         reconnectRunnable?.let(mainHandler::removeCallbacks)
         reconnectRunnable = null
         runCatching { server?.close() }; server = null
@@ -413,6 +674,11 @@ class BridgeService : Service() {
         private const val CHANNEL_ID = "rt950_bridge"
         private const val NOTIFICATION_ID = 9501
         private const val TAG = "RT950Bridge"
+        private const val CHANNEL_MEMORY_ADDRESS = 0x50200
+        private const val CHANNEL_MEMORY_LENGTH = 0xF400
+        private const val CHANNEL_BLOCK_SIZE = 128
+        private const val CHANNEL_READ_RESPONSE_SIZE = 135
+        private const val CHANNEL_WRITE_PACKET_SIZE = 135
         private val SERVICE_UUID: UUID = UUID.fromString("0000ffe0-0000-1000-8000-00805f9b34fb")
         private val CHARACTERISTIC_UUID: UUID = UUID.fromString("0000ffe1-0000-1000-8000-00805f9b34fb")
         private val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
