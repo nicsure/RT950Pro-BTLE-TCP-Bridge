@@ -2,7 +2,9 @@
 
 ### Allows APRSDroid and other KISS apps that may connect to TNCs over a network to communicate with the RT-950 Pro.
 
-Compiled self-signed APKs are available in [Releases](https://github.com/nicsure/RT950Pro-BTLE-TCP-Bridge/releases).
+Compiled self-signed APKs are available in [Releases](https://github.com/nicsure/RT950Pro-BTLE-TCP-Bridge/releases).  
+
+Be aware that Google Play Protect may block installation as this is not an official Play Store app. You can override this however, usually clicking "More Details" then "Install Anyway". The project is fully Open Source so you can review the code, build and pack your own APK with Android Studio if you wish.
 
 
 ## To Use
