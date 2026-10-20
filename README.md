@@ -16,4 +16,10 @@ A compiled self-signed APK is available in [Releases](https://github.com/nicsure
 7. Leave the app running and switch back to the Home Screen on your Android device.
 8. Open your APRS app on your Android device, such as APRSDroid.
 9. Configure the APRS app to use 'KISS TNC' mode and TCP/IP connection. Ensure the port is the same as the one you selected in step 2. The network address should be entered as '127.0.0.1'
+
+## Channel Editor
+
+Once connected to your RT-950 Pro over Bluetooth, a button will appear  `Open Channel Manager`  
+This will pause the TCP Bridge and allow you to manage the radio's channels in a similar way to the RMS.  
+I would advise against using `Read All` and `Write All` as it will be very slow. Instead make use of the `Read Selected` and `Write Selected` buttons.
   
